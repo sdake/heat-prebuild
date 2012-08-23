@@ -1,0 +1,322 @@
+#!/usr/bin/env python
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+'''
+This tool takes a Heat template, builds the images with the specified services
+and files already installed and returns a new template that uses these images.
+'''
+
+from base64 import b64encode
+from copy import deepcopy
+import json
+import logging
+import optparse
+import os.path
+from StringIO import StringIO
+import sys
+
+from glance.common import exception
+from glance import client as glance_client
+from heat.engine import parser as heat_parser
+from lxml import etree
+
+
+# check for a heat-jeos repo next to heat-prebuild and use it if present
+development_heat_jeos_path = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(sys.argv[0])), os.pardir, 'heat-jeos'))
+if os.path.exists(development_heat_jeos_path):
+    sys.path.insert(0, development_heat_jeos_path)
+
+from heat_jeos.cfntools import cfn_helper
+import heat_jeos.utils as jeos_utils
+
+
+def command_prebuild_template(options, arguments):
+    '''
+    Take a Heat template, build all the images it requires and install the
+    services that each resource needs.
+    '''
+    if len(arguments) != 2:
+        fail('You must specify the input and output Heat templates')
+    if os.geteuid() != 0:
+        fail("This command must be run as root")
+
+    client = get_glance_client(options)
+    if not connected_to_glance(client):
+        fail("Cannot connect to Glance. Please verify that it's running and "
+             "check your credentials.")
+
+    input_template_path, output_template_path = arguments
+    with open(input_template_path) as f:
+        template = heat_parser.Template(json.load(f))
+
+    instances = dict((name, resource) for name, resource
+                     in template.t['Resources'].iteritems()
+                     if resource.get('Type') == 'AWS::EC2::Instance')
+
+    parameters = heat_parser.Parameters('', template)
+    images = [image_id_from_resource(resource, template, parameters)
+              for resource in instances.values()]
+    try:
+        tdls = [process_tdl(image_id, resource) for image_id, resource
+                in zip(images, instances.values())]
+    except LookupError, e:
+        fail("Couldn't find image ID: %s" % e.message)
+
+    input_template_name = os.path.splitext(
+        os.path.basename(input_template_path))[0]
+    processed_template = deepcopy(template.t)
+    for resource_name, image_name, tdl in zip(instances.keys(), images, tdls):
+        logging.info('Building image for resource: %s' % resource_name)
+        built_image_path = jeos_utils.build_image_from_tdl(tdl)
+
+        glance_image_name = '/'.join((input_template_name, resource_name,
+                                      image_name))
+        image = find_image_in_glance(client, glance_image_name)
+        register_image(client, built_image_path, glance_image_name, image)
+
+        # Update the template with the new image name
+        resource = processed_template['Resources'][resource_name]
+        resource['Properties']['ImageId'] = glance_image_name
+
+    with open(output_template_path, 'w') as f:
+        json.dump(processed_template, f, indent=4)
+    logging.info("New template saved to: %s" % output_template_path)
+
+
+def image_id_from_resource(resource, template, parameters):
+    image_id_snippet = get_in_dict(resource, ['Properties', 'ImageId'])
+    image_id = heat_parser.resolve_static_data(template, parameters,
+                                               image_id_snippet)
+    return image_id
+
+
+def process_tdl(image_id, resource):
+    tdl_path = jeos_utils.find_template_by_name(None, image_id)
+    if not tdl_path:
+        raise LookupError(image_id)
+    return update_tdl(tdl_path, resource['Metadata'])
+
+
+def get_glance_client(options):
+    '''
+    Returns a new Glance client connection based on the passed options.
+    '''
+    creds = dict(username=options.username,
+                 password=options.password,
+                 tenant=options.tenant,
+                 auth_url=options.auth_url,
+                 strategy=options.auth_strategy)
+
+    # When neither host nor port are specified and we're using Keystone auth,
+    # let it tell us the Glance entrypoint
+    configure_via_auth = (options.auth_strategy == 'keystone' and
+                          not (options.glance_host or options.glance_port))
+
+    # NOTE: these are ignored by the client when `configure_via_auth` is True
+    glance_host = options.glance_host if options.glance_host else '0.0.0.0'
+    try:
+        glance_port = int(options.glance_port) if options.glance_port else 9292
+    except:
+        raise Exception('Glance port must be a number.')
+
+
+    if configure_via_auth:
+        logging.debug('Using Glance entry point received by Keystone.')
+    else:
+        logging.debug('Connecting to Glance at host: %s, port: %d' %
+                      (glance_host, glance_port))
+
+    client = glance_client.Client(host=glance_host,
+                                  port=glance_port,
+                                  use_ssl=False,
+                                  auth_tok=None,
+                                  configure_via_auth=configure_via_auth,
+                                  creds=creds)
+    return client
+
+
+def fail(message):
+    '''
+    Show the error message and exit program.
+    '''
+    logging.error(message)
+    sys.exit(1)
+
+
+def connected_to_glance(client):
+    '''
+    Test whether the client is actually connected to the Glance service
+    '''
+    try:
+        client.get_image('test')
+    except exception.NotFound:
+        pass
+    except Exception:
+        return False
+    return True
+
+
+def find_image_in_glance(client, image_name):
+    '''
+    Looks up the image of a given name in Glance.
+
+    Returns the image metadata or None if no image is found.
+    '''
+    parameters = {
+        "filters": {},
+        "limit": 10,
+    }
+    images = client.get_images(**parameters)
+    try:
+        image = [i for i in images if i['name'] == image_name][0]
+    except IndexError:
+        image = None
+    return image
+
+
+def register_image(client, qcow2_path, name, existing_image):
+    '''
+    Register the given image with Glance.
+    '''
+    image_meta = {'name': name,
+                  'is_public': True,
+                  'disk_format': 'qcow2',
+                  'min_disk': 0,
+                  'min_ram': 0,
+                  'owner': client.creds['username'],
+                  'container_format': 'bare'}
+
+    if existing_image:
+        client.delete_image(existing_image['id'])
+
+    with open(qcow2_path) as ifile:
+        image_meta = client.add_image(image_meta, ifile)
+    image_id = image_meta['id']
+    logging.debug(" Added new image with ID: %s" % image_id)
+    logging.debug(" Returned the following metadata for the new image:")
+    for k, v in sorted(image_meta.items()):
+        logging.debug(" %(k)30s => %(v)s" % locals())
+    return image_id
+
+
+oz_install_services_command = r'''
+/usr/bin/python /opt/aws/bin/heat-install-services &>> /tmp/heat-prebuild-metadata.log
+'''
+
+# This goes to: /opt/aws/bin/heat-install-services in the Oz image
+# It reads the template metadata and installs the required services during
+# image creation.
+heat_install_services_script = r'''
+import json
+import cfn_helper
+
+cfntools = cfn_helper.Metadata(None, None)
+cfntools._metadata = json.loads(open('/tmp/heat-prebuild-metadata').read())
+cfntools.cfn_init()
+'''
+
+
+def update_tdl(tdl_path, metadata):
+    '''
+    Add the custom file and command to the TDL.
+
+    Returns the updated TDL XML representation.
+    '''
+    tdl_xml = etree.parse(tdl_path)
+    commands = tdl_xml.find('/commands')
+    cmd = etree.Element('command')
+    cmd.attrib['name'] = 'heat-install-services'
+    cmd.text = oz_install_services_command
+    commands.append(cmd)
+
+    files = tdl_xml.find('/files')
+
+    script = etree.Element('file')
+    script.attrib['name'] = '/opt/aws/bin/heat-install-services'
+    script.attrib['type'] = 'raw'
+    script.text = heat_install_services_script
+    files.append(script)
+
+    metadata_elem = etree.Element('file')
+    metadata_elem.attrib['name'] = '/tmp/heat-prebuild-metadata'
+    metadata_elem.attrib['type'] = 'base64'
+    metadata_elem.text = b64encode(json.dumps(metadata))
+    files.append(metadata_elem)
+
+    string_writer = StringIO()
+    tdl_xml.write(string_writer, xml_declaration=True)
+    return string_writer.getvalue()
+
+
+def get_in_dict(dictionary, path, default=None):
+    '''
+    Return the value at the path in the nested dictionary.
+
+    If the path isn't available, return the default value instead.
+    '''
+    if not path:
+        return default
+    if not dictionary:
+        return default
+    if len(path) == 1:
+        return dictionary.get(path[0], default)
+    return get_in_dict(dictionary.get(path[0], {}), path[1:], default)
+
+
+def credentials_from_env():
+    return dict(username=os.getenv('OS_USERNAME'),
+                password=os.getenv('OS_PASSWORD'),
+                tenant=os.getenv('OS_TENANT_NAME'),
+                auth_url=os.getenv('OS_AUTH_URL'),
+                auth_strategy=os.getenv('OS_AUTH_STRATEGY'))
+
+
+def parse_options(parser):
+    options, args = parser.parse_args()
+    creds = credentials_from_env()
+    for option, env_val in creds.items():
+       setattr(options, option, env_val)
+
+    if not options.auth_strategy:
+        options.auth_strategy = 'noauth'
+
+    if options.debug:
+        logging.basicConfig(format='%(levelname)s: %(message)s',\
+            level=logging.DEBUG)
+        logging.debug("Debug level logging enabled")
+    else:
+        logging.basicConfig(format='%(levelname)s: %(message)s',\
+            level=logging.WARNING)
+
+    return options, args
+
+
+if __name__ == '__main__':
+    usage = "heat-prebuild [options] <input_template> <output_template>"
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option('-o', '--output-template',
+                       help="path to the resulting template")
+    parser.add_option('-p', '--parameters',
+                      help="Heat template parameters")
+    parser.add_option('-H', '--glance-host', default=None,
+                      help="Glance hostname")
+    parser.add_option('-P', '--glance-port', default=None,
+                      help="Glance port number")
+    parser.add_option('-d', '--debug', default=False,
+                      action='store_true',
+                      help="Show debug messages")
+    options, args = parse_options(parser)
+    command_prebuild_template(options, args)
