@@ -29,6 +29,7 @@ import sys
 
 from glance.common import exception
 from glance import client as glance_client
+from heat.common.exception import UserParameterMissing
 from heat.engine import parser as heat_parser
 from lxml import etree
 
@@ -66,9 +67,16 @@ def command_prebuild_template(options, arguments):
                      in template.t['Resources'].iteritems()
                      if resource.get('Type') == 'AWS::EC2::Instance')
 
-    parameters = heat_parser.Parameters('', template)
-    images = [image_id_from_resource(resource, template, parameters)
-              for resource in instances.values()]
+    user_params = parse_user_parameters(options.parameters)
+    logging.debug('User parameters: %s' % user_params)
+
+    parameters = heat_parser.Parameters('', template, user_params)
+    try:
+        images = [image_id_from_resource(resource, template, parameters)
+                  for resource in instances.values()]
+    except UserParameterMissing, e:
+        fail(str(e))
+
     try:
         tdls = [process_tdl(image_id, resource) for image_id, resource
                 in zip(images, instances.values())]
@@ -79,7 +87,8 @@ def command_prebuild_template(options, arguments):
         os.path.basename(input_template_path))[0]
     processed_template = deepcopy(template.t)
     for resource_name, image_name, tdl in zip(instances.keys(), images, tdls):
-        logging.info('Building image for resource: %s' % resource_name)
+        logging.info("Building image based on: '%s' for resource: '%s'" %
+            (image_name, resource_name))
         built_image_path = jeos_utils.build_image_from_tdl(tdl)
 
         glance_image_name = '/'.join((input_template_name, resource_name,
@@ -101,6 +110,24 @@ def image_id_from_resource(resource, template, parameters):
     image_id = heat_parser.resolve_static_data(template, parameters,
                                                image_id_snippet)
     return image_id
+
+
+def parse_user_parameters(parameters_text):
+    '''
+    Parse the user parameters in the format Heat CLI expets and return a
+    dictionary.
+
+    Example:
+
+    >>> parse_user_parameters('InstanceType=m1.xlarge;LinuxDistribution=F17')
+    {'InstanceType': 'm1.xlarge', 'LinuxDistribution': 'F17'}
+    '''
+    param_items = [p.strip() for p in parameters_text.split(';')]
+    pairs = [p.split('=') for p in param_items if p]
+    result = {}
+    for key, value in pairs:
+        result[key.strip()] = value.strip()
+    return result
 
 
 def process_tdl(image_id, resource):
@@ -294,11 +321,11 @@ def parse_options(parser):
         options.auth_strategy = 'noauth'
 
     if options.debug:
-        logging.basicConfig(format='%(levelname)s: %(message)s',\
+        logging.basicConfig(format='%(levelname)s: %(message)s',
             level=logging.DEBUG)
         logging.debug("Debug level logging enabled")
     else:
-        logging.basicConfig(format='%(levelname)s: %(message)s',\
+        logging.basicConfig(format='%(levelname)s: %(message)s',
             level=logging.WARNING)
 
     return options, args
@@ -309,7 +336,7 @@ if __name__ == '__main__':
     parser = optparse.OptionParser(usage=usage)
     parser.add_option('-o', '--output-template',
                        help="path to the resulting template")
-    parser.add_option('-p', '--parameters',
+    parser.add_option('-p', '--parameters', default='',
                       help="Heat template parameters")
     parser.add_option('-H', '--glance-host', default=None,
                       help="Glance hostname")
